@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"github.com/Dreamacro/clash/tunnel"
 	"net"
 	"strings"
 	"time"
@@ -138,6 +139,55 @@ func withFakeIP(fakePool *fakeip.Pool) middleware {
 		}
 	}
 }
+func withFakeIPOption(fakePool *fakeip.Pool) middleware {
+	return func(next handler) handler {
+		return func(ctx *context.DNSContext, r *D.Msg) (*D.Msg, error) {
+			q := r.Question[0]
+
+			host := strings.TrimRight(q.Name, ".")
+			if fakePool.ShouldSkipped(host) {
+				return next(ctx, r)
+			}
+			var rule C.Rule
+			for _, r := range tunnel.Rules() {
+				metadata := &C.Metadata{}
+				metadata.Host = host
+				if r.Match(metadata) {
+					rule = r
+					break
+				}
+			}
+			if rule != nil {
+				if rule.RuleType() == C.MATCH || rule.Adapter() == "DIRECT" {
+					return next(ctx, r)
+				}
+			}
+			switch q.Qtype {
+			case D.TypeAAAA, D.TypeSVCB, D.TypeHTTPS:
+				return handleMsgWithEmptyAnswer(r), nil
+			}
+
+			if q.Qtype != D.TypeA {
+				return next(ctx, r)
+			}
+
+			rr := &D.A{}
+			rr.Hdr = D.RR_Header{Name: q.Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: dnsDefaultTTL}
+			ip := fakePool.Lookup(host)
+			rr.A = ip
+			msg := r.Copy()
+			msg.Answer = []D.RR{rr}
+
+			ctx.SetType(context.DNSTypeFakeIP)
+			setMsgTTL(msg, 1)
+			msg.SetRcode(r, D.RcodeSuccess)
+			msg.Authoritative = true
+			msg.RecursionAvailable = true
+
+			return msg, nil
+		}
+	}
+}
 
 func withResolver(resolver *Resolver) handler {
 	return func(ctx *context.DNSContext, r *D.Msg) (*D.Msg, error) {
@@ -180,7 +230,8 @@ func newHandler(resolver *Resolver, mapper *ResolverEnhancer) handler {
 	}
 
 	if mapper.mode == C.DNSFakeIP {
-		middlewares = append(middlewares, withFakeIP(mapper.fakePool))
+
+		middlewares = append(middlewares, withFakeIPOption(mapper.fakePool))
 	}
 
 	if mapper.mode != C.DNSNormal {
